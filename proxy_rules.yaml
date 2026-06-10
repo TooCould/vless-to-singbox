@@ -1,0 +1,19 @@
+# Desktop applications that should bypass VLESS completely.
+direct_process:
+  - Feishu.exe
+  - YoudaoDict.exe
+  - YoudaoDictHelper.exe
+  - YoudaoEH.exe
+  - YoudaoOcr.exe
+  - AweSun.exe
+  - awesun_guard.exe
+  - 量子密信.exe
+  - lxmeeting.exe
+
+# Desktop applications that should always use VLESS.
+proxy_process:
+  - claude.exe
+  - cowork-svc.exe
+  - Codex.exe
+  - codex.exe
+  - Cursor.exe
