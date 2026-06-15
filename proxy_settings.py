@@ -27,27 +27,38 @@ class ConfigError(ValueError):
 
 DEFAULT_RULES_PATH = Path(__file__).with_name("proxy_rules.yaml")
 
+# Fallback when proxy_rules.yaml omits listen_port.
+DEFAULT_LISTEN_PORT = 2808
+
 
 MIXED_INBOUND = {
     "type": "mixed",
     "tag": "mixed-in",
     "listen": "127.0.0.1",
-    "listen_port": 2080,
+    "listen_port": DEFAULT_LISTEN_PORT,
 }
 
 TUN_INBOUND = {
     "type": "tun",
     "tag": "tun-in",
-    "address": ["172.19.0.1/30"],
+    "address": ["172.19.0.1/30", "fdfe:dcba:9876::1/126"],
     "auto_route": True,
     "strict_route": True,
+    # system stack: lower latency on Windows than default gVisor userspace stack.
+    "stack": "system",
 }
 
+# Short timeout: enough for TLS ClientHello SNI, avoids the old 300ms stall per connection.
+SNIFF_RULE = {"action": "sniff", "timeout": "50ms", "sniffer": ["tls", "http"]}
 DNS_HIJACK_RULE = {"port": 53, "action": "hijack-dns"}
 PRIVATE_DIRECT_RULE = {"ip_is_private": True, "outbound": "direct"}
 
 GEOSITE_CN_URL = "https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-cn.srs"
 GEOIP_CN_URL = "https://raw.githubusercontent.com/SagerNet/sing-geoip/rule-set/geoip-cn.srs"
+
+# auto 模式：所有 *.cn / *.com.cn 直连（优先于 proxy_domain）。
+CN_TLD_DIRECT_RULE = {"domain_suffix": ["cn"], "outbound": "direct"}
+CN_TLD_DNS_RULE = {"domain_suffix": ["cn"], "action": "route", "server": "local-dns"}
 
 CHINA_RULE_SETS = [
     {
@@ -74,13 +85,10 @@ LOCAL_DNS = {
 }
 
 REMOTE_DNS = {
-    "type": "https",
+    "type": "udp",
     "tag": "remote-dns",
     "server": "1.1.1.1",
-    "server_port": 443,
-    "path": "/dns-query",
-    "tls": {"enabled": True, "server_name": "cloudflare-dns.com"},
-    "detour": "proxy",
+    "server_port": 53,
 }
 
 
@@ -98,7 +106,7 @@ def _normalize_domains(domains: list[str]) -> list[str]:
         if value.startswith("*."):
             value = value[2:]
         if not value or "." not in value or any(char.isspace() for char in value):
-            raise ConfigError(f"invalid proxy domain: {domain}")
+            raise ConfigError(f"invalid domain: {domain}")
         if value not in result:
             result.append(value)
     return result
@@ -118,7 +126,25 @@ def _normalize_processes(processes: list[str]) -> list[str]:
     return result
 
 
-def load_process_rules(path: Path) -> tuple[list[str], list[str]]:
+def _reject_cn_proxy_domains(domains: list[str]) -> None:
+    for domain in domains:
+        if domain == "cn" or domain.endswith(".cn"):
+            raise ConfigError(
+                f"proxy_domain cannot use .cn suffix (all .cn direct in auto): {domain}"
+            )
+
+
+def _normalize_listen_port(value: Any) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ConfigError("listen_port must be an integer between 1 and 65535")
+    if not 1 <= value <= 65535:
+        raise ConfigError("listen_port must be an integer between 1 and 65535")
+    return value
+
+
+def load_rules(
+    path: Path,
+) -> tuple[list[str], list[str], list[str], list[str], int]:
     if yaml is None:
         raise ConfigError("PyYAML is required: python -m pip install PyYAML")
     try:
@@ -133,22 +159,38 @@ def load_process_rules(path: Path) -> tuple[list[str], list[str]]:
     if not isinstance(data, dict):
         raise ConfigError("process rules YAML root must be an object")
 
-    allowed = {"direct_process", "proxy_process"}
+    list_keys = {"direct_process", "direct_domain", "proxy_process", "proxy_domain"}
+    allowed = list_keys | {"listen_port"}
     unknown = sorted(set(data) - allowed)
     if unknown:
         raise ConfigError(f"unknown process rules key: {unknown[0]}")
 
-    for key in allowed:
+    for key in list_keys:
         value = data.get(key, [])
         if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
             raise ConfigError(f"{key} must be a list of strings")
 
-    direct = _normalize_processes(data.get("direct_process", []))
-    proxy = _normalize_processes(data.get("proxy_process", []))
-    overlap = {item.casefold() for item in direct} & {item.casefold() for item in proxy}
+    listen_port = (
+        _normalize_listen_port(data["listen_port"])
+        if "listen_port" in data
+        else DEFAULT_LISTEN_PORT
+    )
+    direct_process = _normalize_processes(data.get("direct_process", []))
+    direct_domain = _normalize_domains(data.get("direct_domain", []))
+    proxy_process = _normalize_processes(data.get("proxy_process", []))
+    proxy_domain = _normalize_domains(data.get("proxy_domain", []))
+    _reject_cn_proxy_domains(proxy_domain)
+    overlap = {item.casefold() for item in direct_process} & {
+        item.casefold() for item in proxy_process
+    }
     if overlap:
         raise ConfigError(f"process cannot be both direct and proxied: {sorted(overlap)[0]}")
-    return direct, proxy
+    domain_overlap = set(direct_domain) & set(proxy_domain)
+    if domain_overlap:
+        raise ConfigError(
+            f"domain cannot be both direct and proxied: {sorted(domain_overlap)[0]}"
+        )
+    return direct_process, direct_domain, proxy_process, proxy_domain, listen_port
 
 
 def _proxy_server_routes(outbounds: list[dict[str, Any]]) -> list[str]:
@@ -189,33 +231,46 @@ def _ensure_outbounds(config: dict[str, Any]) -> tuple[list[dict[str, Any]], boo
     return outbounds, has_proxy
 
 
+def _find_mixed_inbound(
+    inbounds: list[dict[str, Any]],
+    listen_port: int,
+) -> dict[str, Any] | None:
+    for item in inbounds:
+        if item.get("tag") == "mixed-in":
+            return item
+        if (
+            item.get("type") == "mixed"
+            and item.get("listen") == "127.0.0.1"
+            and item.get("listen_port") == listen_port
+        ):
+            return item
+    return None
+
+
 def _configure_inbounds(
     config: dict[str, Any],
     mode: str,
     proxy_server_routes: list[str],
+    listen_port: int,
 ) -> None:
     inbounds = _object_list(config, "inbounds")
 
-    has_mixed = any(
-        item.get("type") == "mixed"
-        and item.get("listen") == "127.0.0.1"
-        and item.get("listen_port") == 2080
-        for item in inbounds
-    )
-    if not has_mixed:
+    mixed = _find_mixed_inbound(inbounds, listen_port)
+    if mixed is None:
         if any(item.get("tag") == "mixed-in" for item in inbounds):
             raise ConfigError('inbound tag "mixed-in" is already used with different settings')
-        inbounds.append(dict(MIXED_INBOUND))
+        mixed = dict(MIXED_INBOUND)
+        inbounds.append(mixed)
+
+    mixed["listen"] = "127.0.0.1"
+    mixed["listen_port"] = listen_port
+    mixed.pop("set_system_proxy", None)
 
     inbounds[:] = [item for item in inbounds if item.get("tag") != "tun-in"]
-    if mode != "off":
+    if mode == "global":
         tun = dict(TUN_INBOUND)
-        if mode == "auto":
-            tun["strict_route"] = False
         if proxy_server_routes:
             tun["route_exclude_address"] = proxy_server_routes
-        if mode == "auto":
-            tun["route_exclude_address_set"] = ["geoip-cn"]
         inbounds.append(tun)
 
 
@@ -224,6 +279,7 @@ def _configure_route(
     mode: str,
     proxy_domains: list[str],
     direct_processes: list[str],
+    direct_domains: list[str],
     proxy_processes: list[str],
 ) -> None:
     route = config.setdefault("route", {})
@@ -231,16 +287,22 @@ def _configure_route(
         raise ConfigError("route must be an object")
 
     rules: list[dict[str, Any]] = []
-    if mode != "off":
-        rules.extend([DNS_HIJACK_RULE, PRIVATE_DIRECT_RULE])
+    if mode == "global":
+        rules.extend([SNIFF_RULE, DNS_HIJACK_RULE, PRIVATE_DIRECT_RULE])
+    elif mode != "off":
+        rules.extend([SNIFF_RULE, PRIVATE_DIRECT_RULE])
     if direct_processes:
         rules.append({"process_name": direct_processes, "outbound": "direct"})
-    if proxy_processes:
-        rules.append({"process_name": proxy_processes, "outbound": "proxy"})
+    if direct_domains:
+        rules.append({"domain_suffix": direct_domains, "outbound": "direct"})
+    if mode == "auto":
+        rules.append(dict(CN_TLD_DIRECT_RULE))
     if proxy_domains:
         rules.append({"domain_suffix": proxy_domains, "outbound": "proxy"})
     if mode == "auto":
         rules.append({"rule_set": ["geosite-cn", "geoip-cn"], "outbound": "direct"})
+    elif mode == "custom" and proxy_processes:
+        rules.append({"process_name": proxy_processes, "outbound": "proxy"})
 
     route["rules"] = rules
     route["auto_detect_interface"] = True
@@ -251,6 +313,8 @@ def _configure_route(
         route.pop("rule_set", None)
     if mode == "off":
         route.pop("default_domain_resolver", None)
+    elif mode == "auto":
+        route["default_domain_resolver"] = "local-dns"
     else:
         route["default_domain_resolver"] = "local-dns"
 
@@ -260,6 +324,7 @@ def _configure_dns(
     mode: str,
     proxy_domains: list[str],
     direct_processes: list[str],
+    direct_domains: list[str],
     proxy_processes: list[str],
 ) -> None:
     if mode == "off":
@@ -275,10 +340,12 @@ def _configure_dns(
         dns["rules"].append(
             {"process_name": direct_processes, "action": "route", "server": "local-dns"}
         )
-    if proxy_processes:
+    if direct_domains:
         dns["rules"].append(
-            {"process_name": proxy_processes, "action": "route", "server": "remote-dns"}
+            {"domain_suffix": direct_domains, "action": "route", "server": "local-dns"}
         )
+    if mode == "auto":
+        dns["rules"].append(dict(CN_TLD_DNS_RULE))
     if proxy_domains:
         dns["rules"].append(
             {"domain_suffix": proxy_domains, "action": "route", "server": "remote-dns"}
@@ -287,9 +354,15 @@ def _configure_dns(
         dns["rules"].append(
             {"rule_set": "geosite-cn", "action": "route", "server": "local-dns"}
         )
-        dns["final"] = "remote-dns"
+        dns["final"] = "local-dns"
     elif mode == "global":
         dns["final"] = "remote-dns"
+    elif mode == "custom":
+        if proxy_processes:
+            dns["rules"].append(
+                {"process_name": proxy_processes, "action": "route", "server": "remote-dns"}
+            )
+        dns["final"] = "local-dns"
     else:
         dns["final"] = "local-dns"
     config["dns"] = dns
@@ -299,8 +372,11 @@ def rewrite_config(
     config: dict[str, Any],
     mode: str = "auto",
     proxy_domains: list[str] | None = None,
+    yaml_proxy_domains: list[str] | None = None,
     direct_processes: list[str] | None = None,
+    direct_domains: list[str] | None = None,
     proxy_processes: list[str] | None = None,
+    listen_port: int = DEFAULT_LISTEN_PORT,
 ) -> dict[str, Any]:
     if not isinstance(config, dict):
         raise ConfigError("config root must be a JSON object")
@@ -309,12 +385,24 @@ def rewrite_config(
     if mode not in {"auto", "off", "global", "custom"}:
         raise ConfigError(f"unsupported mode: {mode}")
 
-    domains = _normalize_domains(proxy_domains or [])
+    cli_domains = _normalize_domains(proxy_domains or [])
+    yaml_domains = _normalize_domains(yaml_proxy_domains or [])
+    _reject_cn_proxy_domains(cli_domains)
     direct_apps = _normalize_processes(direct_processes or [])
+    direct_sites = _normalize_domains(direct_domains or [])
     proxy_apps = _normalize_processes(proxy_processes or [])
     overlap = {item.casefold() for item in direct_apps} & {item.casefold() for item in proxy_apps}
     if overlap:
         raise ConfigError(f"process cannot be both direct and proxied: {sorted(overlap)[0]}")
+    if mode in {"auto", "custom"}:
+        domains = _normalize_domains(cli_domains + yaml_domains)
+    else:
+        domains = []
+    domain_overlap = set(direct_sites) & set(domains)
+    if domain_overlap:
+        raise ConfigError(
+            f"domain cannot be both direct and proxied: {sorted(domain_overlap)[0]}"
+        )
     if mode == "custom" and not (domains or proxy_apps):
         raise ConfigError("custom mode requires --proxy-domain or proxy_process in YAML")
 
@@ -322,10 +410,10 @@ def rewrite_config(
     if mode != "off" and not has_proxy:
         raise ConfigError('config must contain an outbound tagged "proxy"')
 
-    proxy_routes = _proxy_server_routes(outbounds) if mode != "off" else []
-    _configure_inbounds(config, mode, proxy_routes)
-    _configure_route(config, mode, domains, direct_apps, proxy_apps)
-    _configure_dns(config, mode, domains, direct_apps, proxy_apps)
+    proxy_routes = _proxy_server_routes(outbounds) if mode == "global" else []
+    _configure_inbounds(config, mode, proxy_routes, listen_port)
+    _configure_route(config, mode, domains, direct_apps, direct_sites, proxy_apps)
+    _configure_dns(config, mode, domains, direct_apps, direct_sites, proxy_apps)
     return config
 
 
@@ -334,7 +422,7 @@ def rewrite_file(
     mode: str,
     proxy_domains: list[str],
     rules_path: Path = Path("proxy_rules.yaml"),
-) -> Path | None:
+) -> tuple[Path | None, int]:
     try:
         config = json.loads(path.read_text(encoding="utf-8-sig"))
     except FileNotFoundError as exc:
@@ -342,9 +430,24 @@ def rewrite_file(
     except json.JSONDecodeError as exc:
         raise ConfigError(f"invalid JSON at line {exc.lineno}, column {exc.colno}: {exc.msg}") from exc
 
-    direct_processes, proxy_processes = load_process_rules(rules_path)
+    (
+        direct_processes,
+        direct_domains,
+        proxy_processes,
+        yaml_proxy_domains,
+        listen_port,
+    ) = load_rules(rules_path)
     rendered = json.dumps(
-        rewrite_config(config, mode, proxy_domains, direct_processes, proxy_processes),
+        rewrite_config(
+            config,
+            mode,
+            proxy_domains,
+            yaml_proxy_domains,
+            direct_processes,
+            direct_domains,
+            proxy_processes,
+            listen_port,
+        ),
         ensure_ascii=False,
         indent=2,
     ) + "\n"
@@ -372,7 +475,7 @@ def rewrite_file(
     finally:
         if temp_name and os.path.exists(temp_name):
             os.unlink(temp_name)
-    return created_backup
+    return created_backup, listen_port
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -387,14 +490,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--mode",
         choices=["auto", "off", "global", "tun", "custom"],
         default="auto",
-        help="routing mode (default: auto; tun is an alias for global)",
+        help="routing mode: auto=system proxy split, global/tun=TUN (default: auto)",
     )
     parser.add_argument(
         "--proxy-domain",
         action="append",
         default=[],
         metavar="DOMAIN",
-        help="force a domain and its subdomains through VLESS; may be repeated",
+        help="extra proxy domain suffix (also see proxy_domain in YAML); .cn not allowed",
     )
     parser.add_argument(
         "--rules-file",
@@ -409,7 +512,7 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     path = Path(args.config)
     try:
-        backup = rewrite_file(
+        backup, listen_port = rewrite_file(
             path,
             args.mode,
             args.proxy_domain,
@@ -423,8 +526,11 @@ def main(argv: list[str] | None = None) -> int:
     print(f"proxy mode set to {normalized_mode} in {path}")
     if backup:
         print(f"original config backed up to {backup}")
-    if normalized_mode != "off":
+    if normalized_mode == "global":
         print("run sing-box with Administrator privileges")
+    elif normalized_mode == "auto":
+        print(f"start with: python run_singbox_auto.py {path}")
+        print(f"(v2rayN-style system proxy: 127.0.0.1:{listen_port} + <local> bypass)")
     return 0
 
 

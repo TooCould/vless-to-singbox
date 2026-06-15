@@ -1,4 +1,13 @@
-# Desktop applications that should bypass VLESS completely.
+# auto 模式：默认走代理。
+# - 所有 *.cn 直连（代码内置，不可被 proxy_domain 覆盖）
+# - geosite-cn / geoip-cn 命中的国内站直连
+# - direct_process / direct_domain 为额外直连例外
+# - proxy_domain 强制走代理（覆盖 geosite-cn 里的同品牌条目；不可写 .cn）
+
+# 混合代理(SOCKS/HTTP)监听端口。auto 模式系统代理也指向该端口，
+# proxy_settings.py 与 run_singbox_auto.py 均以此为唯一来源。
+listen_port: 2808
+
 direct_process:
   - Feishu.exe
   - YoudaoDict.exe
@@ -10,10 +19,66 @@ direct_process:
   - 量子密信.exe
   - lxmeeting.exe
 
-# Desktop applications that should always use VLESS.
-proxy_process:
-  - claude.exe
-  - cowork-svc.exe
-  - Codex.exe
-  - codex.exe
-  - Cursor.exe
+# 额外指定需要直连的域名（后缀匹配）。
+direct_domain:
+  - doubao.com
+  - deepseek.com
+
+# 强制走代理（后缀匹配；不可使用 .cn 域名）。
+proxy_domain:
+  # Google
+  - google.com
+  - googleapis.com
+  - gstatic.com
+  - googlevideo.com
+  - googlesyndication.com
+  - googletagmanager.com
+  - google-analytics.com
+  - googleadservices.com
+  - googletraveladservices.com
+  - googleoptimize.com
+  - googleflights.net
+  - gvt1.com
+  - gvt2.com
+  - ggpht.com
+  - youtube.com
+  - ytimg.com
+  - gmail.com
+  - googleusercontent.com
+  - withgoogle.com
+  - chrome.com
+  - android.com
+  # Microsoft
+  - microsoft.com
+  - microsoftonline.com
+  - office.com
+  - office.net
+  - office365.com
+  - live.com
+  - windows.com
+  - windows.net
+  - windowsupdate.com
+  - azure.com
+  - azureedge.net
+  - bing.com
+  - skype.com
+  - visualstudio.com
+  - github.com
+  - github.io
+  - githubusercontent.com
+  # Apple
+  - apple.com
+  - icloud.com
+  - icloud-content.com
+  - mzstatic.com
+  - me.com
+  # AI
+  - anthropic.com
+  - claude.ai
+  - claude.com
+  - openai.com
+  - chatgpt.com
+  - oaistatic.com
+  - oaiusercontent.com
+  - cursor.com
+  - cursor.sh

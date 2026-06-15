@@ -1,0 +1,15 @@
+# Python bytecode cache
+__pycache__/
+*.py[cod]
+
+# sing-box generated config + backups
+config.json
+config.json.bak
+*.bak
+
+# sing-box debug logs
+singbox-debug.log
+*.log
+
+# obsolete
+rule-sets/
